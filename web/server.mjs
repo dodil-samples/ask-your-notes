@@ -44,8 +44,14 @@ function readBody(req) {
 }
 
 // Transient errors worth retrying: DNS blips (the platform's per-app record can be
-// briefly NXDOMAIN right after deploy while it propagates) and connection resets.
-const TRANSIENT = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT"]);
+// briefly NXDOMAIN right after deploy while it propagates), connection resets, and a
+// stalled attempt we aborted on TIMEOUT_MS.
+const TRANSIENT = new Set([
+  "ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT",
+  "UND_ERR_CONNECT_TIMEOUT", "TimeoutError", "AbortError", "UND_ERR_ABORTED",
+]);
+const TIMEOUT_MS = 15000; // abort a single stalled attempt (Node fetch has NO default timeout)
+const DEADLINE_MS = 30000; // give up overall — better a clear error than a spinner that never ends
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function forward(body) {
@@ -53,16 +59,18 @@ async function forward(body) {
   // key must win, so the private tier stays reachable through this same proxy).
   if (!body.key && PUBLIC_KEY) body.key = PUBLIC_KEY;
   const payload = JSON.stringify(body);
+  const started = Date.now();
   let lastCode = "";
-  for (let attempt = 0; attempt < 5; attempt++) {
-    if (attempt) await sleep(150 * attempt); // brief backoff so a new DNS lookup is issued
+  for (let attempt = 0; Date.now() - started < DEADLINE_MS; attempt++) {
+    if (attempt) await sleep(Math.min(150 * attempt, 800)); // backoff so a new DNS lookup is issued
     const res = await fetch(BACKEND_URL, {
       method: "POST", headers: { "content-type": "application/json" }, body: payload,
-    }).catch((e) => { lastCode = e?.cause?.code || e.message; return null; });
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    }).catch((e) => { lastCode = e?.cause?.code || e.name || e.message; return null; });
     if (res) return await res.json().catch(() => ({ ok: false, error: "non-JSON response" }));
     if (!TRANSIENT.has(lastCode)) break; // a non-transient failure won't get better by retrying
   }
-  console.error("backend fetch failed after retries:", lastCode);
+  console.error("backend fetch failed:", lastCode);
   return { ok: false, error: "backend unreachable" };
 }
 
