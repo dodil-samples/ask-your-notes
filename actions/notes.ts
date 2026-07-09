@@ -9,6 +9,7 @@ import { stringify as csvStringify } from "@std/csv";
 import {
   excerptOf,
   type Json,
+  noteIdFromKey,
   nowIso,
   parseWikilinks,
   resolveId,
@@ -200,14 +201,94 @@ export async function tags(k3: K3, _p: Json): Promise<Json> {
 export async function graph(k3: K3, p: Json): Promise<Json> {
   const limit = Math.min(Number(p.limit ?? 200), 1000);
   const nodes = await k3.execute(
-    `SELECT note_id, title, slug FROM notes WHERE deleted=0 ORDER BY updated_at DESC LIMIT ${limit}`,
+    `SELECT note_id, title, slug, excerpt FROM notes WHERE deleted=0 ORDER BY updated_at DESC LIMIT ${limit}`,
   );
   const ids = new Set(nodes.map((n) => String(n.note_id)));
   const edgeRows = await k3.execute(`SELECT src_id, dst_id FROM links WHERE dst_id <> ''`);
   const edges = edgeRows
     .filter((e) => ids.has(String(e.src_id)) && ids.has(String(e.dst_id)))
     .map((e) => ({ source: String(e.src_id), target: String(e.dst_id) }));
-  return { nodes, edges, node_count: nodes.length, edge_count: edges.length };
+
+  // The structural graph (wikilink edges) is always returned. When the client asks
+  // to `group`, we ALSO overlay a semantic clustering: run each note through vector
+  // search, connect notes whose similarity clears a threshold, and union-find the
+  // result into colour-able clusters — Obsidian's "group by folder", but by meaning.
+  let groups: number[] | undefined, simEdges: Json[] | undefined, groupCount = 0;
+  if (p.group && nodes.length > 1 && nodes.length <= 80) {
+    // 0.58 sits in the natural gap for jina-embeddings-v4: same-topic notes score
+    // ~0.6-0.75, loosely-related cross-topic notes ~0.5-0.54. Tune per embed model.
+    const g = await similarityGroups(k3, nodes, Number(p.sim_threshold ?? 0.58));
+    groups = g.groups;
+    simEdges = g.simEdges;
+    groupCount = g.groupCount;
+  }
+
+  const outNodes = nodes.map((n, i) => ({
+    note_id: n.note_id,
+    title: n.title,
+    slug: n.slug,
+    ...(groups ? { group: groups[i] } : {}),
+  }));
+  return {
+    nodes: outNodes,
+    edges,
+    node_count: nodes.length,
+    edge_count: edges.length,
+    ...(groups ? { grouped: true, group_count: groupCount, sim_edges: simEdges } : {}),
+  };
+}
+
+/** Cluster notes by vector similarity. For each note we embed-search the vault and
+ *  union it with its nearest neighbours above `threshold`; connected components are
+ *  the groups. Searches run in parallel (bounded by node count ≤ 80). Best-effort:
+ *  if the vector index is cold/unavailable, every note lands in its own group. */
+async function similarityGroups(
+  k3: K3,
+  nodes: Record<string, unknown>[],
+  threshold: number,
+): Promise<{ groups: number[]; simEdges: Json[]; groupCount: number }> {
+  const idOf = (n: Record<string, unknown>) => String(n.note_id);
+  const index = new Map(nodes.map((n, i) => [idOf(n), i]));
+  const parent = nodes.map((_, i) => i);
+  const find = (x: number): number => {
+    while (parent[x] !== x) parent[x] = parent[parent[x]], x = parent[x];
+    return x;
+  };
+  const union = (a: number, b: number) => {
+    parent[find(a)] = find(b);
+  };
+
+  const hitsPer = await Promise.all(
+    nodes.map((n) =>
+      k3.vectorSearch(`${String(n.title ?? "")}. ${String(n.excerpt ?? "")}`.trim(), 5).catch(() => [])
+    ),
+  );
+
+  const seen = new Set<string>();
+  const simEdges: Json[] = [];
+  hitsPer.forEach((hits, i) => {
+    const srcId = idOf(nodes[i]);
+    for (const h of hits) {
+      const tid = noteIdFromKey(String(h.key ?? ""));
+      if (!tid || tid === srcId || !index.has(tid)) continue;
+      const score = Number(h.score ?? 0);
+      if (score < threshold) continue;
+      union(i, index.get(tid)!);
+      const pair = [srcId, tid].sort().join("|");
+      if (!seen.has(pair)) {
+        seen.add(pair);
+        simEdges.push({ source: srcId, target: tid, score: Math.round(score * 1000) / 1000 });
+      }
+    }
+  });
+
+  const rootToGroup = new Map<number, number>();
+  const groups = nodes.map((_, i) => {
+    const r = find(i);
+    if (!rootToGroup.has(r)) rootToGroup.set(r, rootToGroup.size);
+    return rootToGroup.get(r)!;
+  });
+  return { groups, simEdges, groupCount: rootToGroup.size };
 }
 
 export async function exportVault(k3: K3, p: Json): Promise<Json> {

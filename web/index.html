@@ -60,8 +60,9 @@
           border:1px solid var(--border); color:var(--ink2); background:var(--plane); cursor:pointer; }
   .chip.on { background:var(--accent-soft); color:var(--ink); border-color:transparent; }
   .noteitem { padding:9px 10px; border:1px solid var(--border); border-radius:9px; margin-bottom:7px;
-              background:var(--plane); cursor:pointer; }
+              background:var(--plane); cursor:pointer; transition:border-color .12s, background .12s; }
   .noteitem:hover { border-color:var(--accent); }
+  .noteitem.active { border-color:var(--accent); background:var(--accent-soft); }
   .noteitem .t { font-weight:600; }
   .noteitem .e { color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis;
                  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
@@ -82,6 +83,25 @@
   label.fld { display:flex; flex-direction:column; gap:3px; font-size:12px; color:var(--muted); }
   .hidden { display:none; }
   .small { font-size:12px; }
+
+  /* --- graph --- */
+  .graphhead { display:flex; align-items:center; gap:8px; margin-top:16px; }
+  .gbtn { padding:5px 10px; font-size:12px; border-radius:7px; }
+  .gbtn.on { background:var(--accent); color:#fff; border-color:transparent; }
+  .legend { display:flex; flex-wrap:wrap; gap:6px 14px; margin-top:8px; min-height:0; }
+  .legend:empty { display:none; }
+  .legend .lg { display:flex; align-items:center; gap:5px; font-size:11px; color:var(--ink2); }
+  .legend .dot { width:10px; height:10px; border-radius:50%; flex:none; }
+  .graphbox { position:relative; height:400px; margin-top:10px; border:1px solid var(--border);
+              border-radius:10px; background:
+                radial-gradient(circle at 1px 1px, var(--grid) 1px, transparent 0) 0 0/22px 22px, var(--plane);
+              overflow:hidden; touch-action:none; }
+  #graphCanvas { width:100%; height:100%; display:block; cursor:grab; }
+  #graphCanvas.grabbing { cursor:grabbing; }
+  .ghint { position:absolute; left:8px; bottom:7px; font-size:11px; color:var(--muted); pointer-events:none;
+           background:color-mix(in srgb, var(--surface) 72%, transparent); padding:1px 7px; border-radius:6px; }
+  .gempty { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+            color:var(--muted); font-size:13px; text-align:center; padding:0 24px; pointer-events:none; }
 </style>
 </head>
 <body>
@@ -114,18 +134,31 @@
     <div id="askOut" class="hidden" style="margin-top:12px"></div>
   </section>
 
-  <!-- OVERVIEW -->
+  <!-- OVERVIEW + GRAPH -->
   <section class="card">
-    <h2>Vault overview <span class="sub">— public_overview, no credentials</span></h2>
+    <h2>Vault overview <span class="sub">— a live map of your notes</span></h2>
     <div class="tiles" id="tiles"><span class="muted">Loading…</span></div>
     <div id="tagcloud" style="margin-top:14px"></div>
+
+    <div class="graphhead">
+      <span class="small muted" id="graphMeta">Graph</span>
+      <span class="spacer"></span>
+      <button id="graphGroup" class="gbtn" title="Colour nodes by semantic (vector) similarity">⬡ Group</button>
+      <button id="graphReset" class="gbtn" title="Re-centre the graph">⟲ Reset</button>
+    </div>
+    <div id="graphLegend" class="legend"></div>
+    <div class="graphbox">
+      <canvas id="graphCanvas"></canvas>
+      <div id="graphEmpty" class="gempty hidden"></div>
+      <div class="ghint">drag to pan · scroll to zoom · click a node to open</div>
+    </div>
   </section>
 
   <div class="cols">
     <!-- LEFT: search + list -->
     <div>
       <section class="card">
-        <h2>Search <span class="sub">— semantic</span></h2>
+        <h2>Notes <span class="sub">— search is semantic</span></h2>
         <div class="row">
           <input id="searchQ" class="grow" placeholder="search notes…" />
           <button id="searchBtn">Go</button>
@@ -137,7 +170,7 @@
     <!-- RIGHT: viewer / editor -->
     <div>
       <section class="card" id="viewerCard">
-        <h2 id="viewerHead">Note <span class="sub" id="viewerSub">— select a note on the left</span></h2>
+        <h2 id="viewerHead">Note <span class="sub" id="viewerSub">— select a note, or click a graph node</span></h2>
         <div id="viewer"><span class="muted small">Nothing selected.</span></div>
       </section>
 
@@ -161,7 +194,7 @@
     Reading is anonymous — the page calls its own origin, which proxies to the app's
     public FQDN. Authoring needs an admin key (⚙ Settings); it is attached to the
     request and never stored in the page. Notes are markdown objects in K3; the
-    <code>[[wikilink]]</code> graph and semantic index are built server-side.
+    <code>[[wikilink]]</code> graph and the semantic (vector) index are built server-side.
   </p>
 </div>
 <script src="./app.js"></script>

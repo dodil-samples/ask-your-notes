@@ -57,7 +57,7 @@ function renderMd(src) {
 }
 const slug = (s) => (String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "untitled").slice(0, 80);
 
-// ------------------------------------------------------------------- overview
+// ------------------------------------------------------------------- overview + graph
 async function loadOverview() {
   const r = await invoke("public_overview", { limit: 8 });
   if (!r.ok) { $("tiles").innerHTML = `<span class="err">${esc(r.error || "failed")}</span>`; return; }
@@ -68,15 +68,17 @@ async function loadOverview() {
     .map((t) => `<span class="chip" data-tag="${esc(t.tag)}">${esc(t.tag)} · ${t.notes}</span>`).join("") ||
     `<span class="muted small">No tags yet.</span>`;
   renderList(r.result.recent || []);
+  graph.load(); // paint the vault map alongside the tiles
 }
 
 // ------------------------------------------------------------------- list + search
 let activeTag = "";
+let activeNoteId = "";
 function renderList(notes) {
   const el = $("notelist");
-  if (!notes.length) { el.innerHTML = `<span class="muted small">No notes yet — create one on the right.</span>`; return; }
+  if (!notes.length) { el.innerHTML = `<span class="muted small">No notes found.</span>`; return; }
   el.innerHTML = notes.map((n) => `
-    <div class="noteitem" data-slug="${esc(n.slug)}" data-id="${esc(n.note_id || "")}">
+    <div class="noteitem${n.note_id === activeNoteId ? " active" : ""}" data-slug="${esc(n.slug)}" data-id="${esc(n.note_id || "")}">
       <div class="t">${esc(n.title)}</div>
       <div class="e">${esc(n.excerpt || "")}</div>
     </div>`).join("");
@@ -94,11 +96,21 @@ async function filterByTag(tag) {
 }
 
 // ------------------------------------------------------------------- viewer
+/** Open a note in the reading pane. Highlights it in the list + graph, and brings
+ *  the pane into view — the "why did nothing happen?" fix on narrow screens. */
 async function openNote(slugOrId) {
+  $("viewerHead").innerHTML = `Loading… <span class="sub"></span>`;
+  $("viewer").innerHTML = `<span class="muted small">Fetching note…</span>`;
+  bringViewerIntoView();
   const payload = slugOrId.startsWith("n_") ? { note_id: slugOrId } : { slug: slugOrId };
   const r = await invoke("get_note", payload);
-  if (!r.ok) { $("viewer").innerHTML = `<span class="err">${esc(r.error || "not found")}</span>`; return; }
+  if (!r.ok) {
+    $("viewerHead").innerHTML = `Note <span class="sub">— not found</span>`;
+    $("viewer").innerHTML = `<span class="err">${esc(r.error || "not found")}</span>`;
+    return;
+  }
   const n = r.result;
+  setActiveNote(n.note_id);
   $("viewerHead").innerHTML = `${esc(n.title)} <span class="sub">/${esc(n.slug)}</span>`;
   $("viewerSub").textContent = "";
   const tags = (n.tags || []).map((t) => `<span class="chip" data-tag="${esc(t)}">${esc(t)}</span>`).join("");
@@ -114,6 +126,22 @@ async function openNote(slugOrId) {
   if (store.ak) loadIntoEditor(n);
 }
 
+/** Reflect the open note everywhere: list rows, graph node, and remembered id. */
+function setActiveNote(noteId) {
+  activeNoteId = noteId || "";
+  document.querySelectorAll("#notelist .noteitem").forEach((el) =>
+    el.classList.toggle("active", el.getAttribute("data-id") === activeNoteId));
+  graph.setActive(activeNoteId);
+}
+
+function bringViewerIntoView() {
+  // Only scroll when the pane is off-screen (i.e. stacked below on narrow layouts).
+  const rect = $("viewerCard").getBoundingClientRect();
+  if (rect.top < 0 || rect.top > window.innerHeight - 120) {
+    $("viewerCard").scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+}
+
 // ------------------------------------------------------------------- ask (RAG)
 async function doAsk() {
   const q = $("askQ").value.trim(); if (!q) return;
@@ -126,6 +154,220 @@ async function doAsk() {
   out.innerHTML = `<div class="answer">${esc(r.result.answer)}</div>` +
     (cites ? `<div class="cites"><span class="small muted">Sources:</span> ${cites}</div>` : "");
 }
+
+// ================================================================= graph (force layout)
+// A dependency-free, Obsidian-style force-directed graph on <canvas>. Nodes are notes,
+// solid edges are [[wikilinks]]. The "Group" toggle asks the backend to cluster notes by
+// vector similarity; grouped nodes are coloured by cluster and pulled together, with the
+// faint similarity edges drawn dashed.
+const GROUP_COLORS = ["#6d4bd6", "#0ca30c", "#e0842b", "#2f7fe0", "#d03b3b", "#12a6a6", "#b23bd0", "#8a8f2a", "#d0417f", "#4a5568"];
+const graph = (() => {
+  const canvas = $("graphCanvas");
+  let ctx = canvas.getContext("2d");
+  let W = 0, H = 0, dpr = 1;
+  let nodes = [], links = [], grouped = false, groupCount = 0;
+  let cam = { s: 1, x: 0, y: 0 };
+  let alpha = 0, running = false, autoFit = true;
+  let activeId = "", hoverId = "";
+  let drag = null, pan = null, downAt = null, moved = false;
+
+  const cssVar = (name) => getComputedStyle(document.body).getPropertyValue(name).trim() || "#888";
+
+  function resize() {
+    const r = canvas.getBoundingClientRect();
+    W = r.width; H = r.height;
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  async function load() {
+    const r = await invoke("graph", grouped ? { group: true, limit: 400 } : { limit: 400 });
+    if (!r.ok) { $("graphEmpty").textContent = r.error || "graph unavailable"; $("graphEmpty").classList.remove("hidden"); return; }
+    build(r.result);
+  }
+
+  function build(data) {
+    resize();
+    const prev = new Map(nodes.map((n) => [n.note_id, n]));
+    const list = data.nodes || [];
+    nodes = list.map((n, i) => {
+      const p = prev.get(n.note_id);
+      const a = (i / Math.max(list.length, 1)) * Math.PI * 2;
+      return {
+        ...n,
+        x: p ? p.x : Math.cos(a) * 150 + (Math.random() * 16 - 8),
+        y: p ? p.y : Math.sin(a) * 150 + (Math.random() * 16 - 8),
+        vx: 0, vy: 0, deg: 0,
+      };
+    });
+    const byId = new Map(nodes.map((n) => [n.note_id, n]));
+    grouped = !!data.grouped;
+    groupCount = data.group_count || 0;
+    const struct = (data.edges || []).map((e) => ({ s: byId.get(e.source), t: byId.get(e.target), kind: "link" }));
+    const sim = grouped ? (data.sim_edges || []).map((e) => ({ s: byId.get(e.source), t: byId.get(e.target), kind: "sim" })) : [];
+    links = [...struct, ...sim].filter((l) => l.s && l.t && l.s !== l.t);
+    for (const l of links) { if (l.kind === "link") { l.s.deg++; l.t.deg++; } }
+    $("graphEmpty").classList.toggle("hidden", nodes.length > 0);
+    if (!nodes.length) $("graphEmpty").textContent = "No notes yet — create one to grow the graph.";
+    setMeta(data); setLegend();
+    autoFit = true; reheat(1); loop();
+  }
+
+  function setMeta(data) {
+    const parts = [`${data.node_count || 0} notes`, `${data.edge_count || 0} links`];
+    if (grouped) parts.push(`${groupCount} cluster${groupCount === 1 ? "" : "s"}`);
+    $("graphMeta").textContent = parts.join(" · ");
+  }
+  function setLegend() {
+    const el = $("graphLegend");
+    if (!grouped || groupCount < 2) { el.innerHTML = ""; return; }
+    const counts = {};
+    for (const n of nodes) counts[n.group] = (counts[n.group] || 0) + 1;
+    el.innerHTML = Object.keys(counts).sort((a, b) => a - b).map((g) =>
+      `<span class="lg"><span class="dot" style="background:${GROUP_COLORS[g % GROUP_COLORS.length]}"></span>Cluster ${Number(g) + 1} · ${counts[g]}</span>`).join("");
+  }
+
+  // ---- simulation ----
+  const REPULSE = 2600, SPRING = 0.035, LINK_LEN = 66, SIM_LEN = 40, GRAVITY = 0.02, GROUP_PULL = 0.05, DAMP = 0.82;
+  function reheat(a = 0.6) { alpha = Math.max(alpha, a); }
+  function tick() {
+    for (const n of nodes) { n.fx = 0; n.fy = 0; }
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        let dx = a.x - b.x, dy = a.y - b.y, d2 = dx * dx + dy * dy || 0.01;
+        const d = Math.sqrt(d2), f = REPULSE / d2, ux = dx / d, uy = dy / d;
+        a.fx += ux * f; a.fy += uy * f; b.fx -= ux * f; b.fy -= uy * f;
+      }
+    }
+    for (const l of links) {
+      let dx = l.t.x - l.s.x, dy = l.t.y - l.s.y, d = Math.sqrt(dx * dx + dy * dy) || 0.01;
+      const len = l.kind === "sim" ? SIM_LEN : LINK_LEN, f = (d - len) * SPRING, ux = dx / d, uy = dy / d;
+      l.s.fx += ux * f; l.s.fy += uy * f; l.t.fx -= ux * f; l.t.fy -= uy * f;
+    }
+    if (grouped && groupCount > 1) {
+      const c = {};
+      for (const n of nodes) { const g = c[n.group] || (c[n.group] = { x: 0, y: 0, n: 0 }); g.x += n.x; g.y += n.y; g.n++; }
+      for (const g in c) { c[g].x /= c[g].n; c[g].y /= c[g].n; }
+      for (const n of nodes) { const g = c[n.group]; n.fx += (g.x - n.x) * GROUP_PULL; n.fy += (g.y - n.y) * GROUP_PULL; }
+    }
+    for (const n of nodes) { n.fx += -n.x * GRAVITY; n.fy += -n.y * GRAVITY; }
+    for (const n of nodes) {
+      if (n === (drag && drag.node)) continue;
+      n.vx = (n.vx + n.fx * alpha) * DAMP; n.vy = (n.vy + n.fy * alpha) * DAMP;
+      const sp = Math.hypot(n.vx, n.vy); if (sp > 40) { n.vx *= 40 / sp; n.vy *= 40 / sp; }
+      n.x += n.vx; n.y += n.vy;
+    }
+    alpha *= 0.985;
+  }
+
+  function fitCamera(lerp) {
+    if (!nodes.length) return;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const n of nodes) { minX = Math.min(minX, n.x); maxX = Math.max(maxX, n.x); minY = Math.min(minY, n.y); maxY = Math.max(maxY, n.y); }
+    const pad = 60, w = (maxX - minX) || 1, h = (maxY - minY) || 1;
+    const s = Math.max(0.25, Math.min(2.4, Math.min(W / (w + pad), H / (h + pad))));
+    const tx = W / 2 - ((minX + maxX) / 2) * s, ty = H / 2 - ((minY + maxY) / 2) * s;
+    cam.s += (s - cam.s) * lerp; cam.x += (tx - cam.x) * lerp; cam.y += (ty - cam.y) * lerp;
+  }
+
+  const sx = (n) => cam.x + n.x * cam.s;
+  const sy = (n) => cam.y + n.y * cam.s;
+  const radius = (n) => (5 + Math.min(n.deg, 8) * 0.9) * Math.max(0.7, Math.min(cam.s, 1.4));
+
+  function render() {
+    ctx.clearRect(0, 0, W, H);
+    const edgeCol = cssVar("--grid"), accent = cssVar("--accent"), ink = cssVar("--ink2");
+    const active = nodes.find((n) => n.note_id === activeId);
+    const hover = nodes.find((n) => n.note_id === hoverId);
+    const focus = active || hover;
+    const near = new Set();
+    if (focus) { near.add(focus.note_id); for (const l of links) { if (l.s === focus) near.add(l.t.note_id); if (l.t === focus) near.add(l.s.note_id); } }
+    // edges
+    for (const l of links) {
+      const hot = focus && (l.s === focus || l.t === focus);
+      ctx.beginPath(); ctx.moveTo(sx(l.s), sy(l.s)); ctx.lineTo(sx(l.t), sy(l.t));
+      if (l.kind === "sim") { ctx.setLineDash([4, 4]); ctx.strokeStyle = GROUP_COLORS[(l.s.group ?? 0) % GROUP_COLORS.length]; ctx.globalAlpha = hot ? 0.5 : 0.22; ctx.lineWidth = 1; }
+      else { ctx.setLineDash([]); ctx.strokeStyle = hot ? accent : edgeCol; ctx.globalAlpha = focus && !hot ? 0.25 : 1; ctx.lineWidth = hot ? 1.8 : 1; }
+      ctx.stroke();
+    }
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+    // nodes
+    for (const n of nodes) {
+      const r = radius(n), x = sx(n), y = sy(n);
+      const col = grouped ? GROUP_COLORS[(n.group ?? 0) % GROUP_COLORS.length] : accent;
+      ctx.globalAlpha = focus && !near.has(n.note_id) ? 0.35 : 1;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fillStyle = col; ctx.fill();
+      if (n.note_id === activeId) { ctx.lineWidth = 2.5; ctx.strokeStyle = cssVar("--ink"); ctx.stroke(); }
+      // labels: all when the graph is small or zoomed in; else only focused/neighbours
+      if (nodes.length <= 24 || cam.s > 1.05 || (focus && near.has(n.note_id))) {
+        ctx.globalAlpha = focus && !near.has(n.note_id) ? 0.35 : 1;
+        ctx.fillStyle = ink; ctx.font = "11px system-ui, sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "top";
+        ctx.fillText(n.title.length > 22 ? n.title.slice(0, 21) + "…" : n.title, x, y + r + 2);
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function loop() {
+    if (running) return; running = true;
+    const step = () => {
+      if (alpha > 0.02) tick();
+      if (autoFit) fitCamera(0.12);
+      render();
+      if (alpha > 0.015 || autoFit) requestAnimationFrame(step);
+      else { running = false; render(); }
+    };
+    requestAnimationFrame(step);
+  }
+
+  // ---- interaction ----
+  const toWorld = (px, py) => ({ x: (px - cam.x) / cam.s, y: (py - cam.y) / cam.s });
+  function nodeAt(px, py) {
+    const w = toWorld(px, py); let best = null, bd = Infinity;
+    for (const n of nodes) { const d = Math.hypot(n.x - w.x, n.y - w.y); const rr = radius(n) / cam.s + 6 / cam.s; if (d < rr && d < bd) { bd = d; best = n; } }
+    return best;
+  }
+  const relPos = (e) => { const r = canvas.getBoundingClientRect(); return { x: e.clientX - r.left, y: e.clientY - r.top }; };
+
+  canvas.addEventListener("pointerdown", (e) => {
+    canvas.setPointerCapture(e.pointerId); const p = relPos(e); downAt = p; moved = false;
+    const n = nodeAt(p.x, p.y);
+    if (n) drag = { node: n }; else pan = { x: e.clientX, y: e.clientY };
+    canvas.classList.add("grabbing");
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    const p = relPos(e);
+    if (drag) { const w = toWorld(p.x, p.y); drag.node.x = w.x; drag.node.y = w.y; drag.node.vx = drag.node.vy = 0; autoFit = false; reheat(0.5); loop(); moved = true; return; }
+    if (pan) { cam.x += e.clientX - pan.x; cam.y += e.clientY - pan.y; pan = { x: e.clientX, y: e.clientY }; autoFit = false; moved = true; loop(); return; }
+    const n = nodeAt(p.x, p.y); const id = n ? n.note_id : "";
+    if (id !== hoverId) { hoverId = id; canvas.style.cursor = n ? "pointer" : "grab"; loop(); }
+  });
+  const endPointer = (e) => {
+    const p = downAt ? relPos(e) : null;
+    if (p && downAt && Math.hypot(p.x - downAt.x, p.y - downAt.y) < 5 && !moved) {
+      const n = nodeAt(p.x, p.y); if (n) openNote(n.slug);
+    }
+    drag = null; pan = null; downAt = null; canvas.classList.remove("grabbing");
+  };
+  canvas.addEventListener("pointerup", endPointer);
+  canvas.addEventListener("pointercancel", () => { drag = null; pan = null; downAt = null; canvas.classList.remove("grabbing"); });
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault(); const p = relPos(e); const w = toWorld(p.x, p.y);
+    const k = Math.exp(-e.deltaY * 0.0015); cam.s = Math.max(0.2, Math.min(4, cam.s * k));
+    cam.x = p.x - w.x * cam.s; cam.y = p.y - w.y * cam.s; autoFit = false; loop();
+  }, { passive: false });
+
+  window.addEventListener("resize", () => { resize(); reheat(0.2); loop(); });
+
+  return {
+    load,
+    setActive(id) { activeId = id || ""; loop(); },
+    toggleGroup() { grouped = !grouped; $("graphGroup").classList.toggle("on", grouped); $("graphMeta").textContent = "Grouping…"; return load(); },
+    reset() { autoFit = true; reheat(0.6); loop(); },
+  };
+})();
 
 // ------------------------------------------------------------------- editor (admin)
 function loadIntoEditor(n) {
@@ -153,7 +395,7 @@ async function deleteNote() {
   if (!$("edId").value || !confirm("Delete this note?")) return;
   const r = await invoke("delete_note", { note_id: $("edId").value });
   $("edMsg").textContent = r.ok ? "deleted" : (r.error || "failed");
-  if (r.ok) { clearEditor(); $("viewer").innerHTML = `<span class="muted small">Nothing selected.</span>`; loadOverview(); }
+  if (r.ok) { clearEditor(); $("viewer").innerHTML = `<span class="muted small">Nothing selected.</span>`; activeNoteId = ""; loadOverview(); }
 }
 
 // ------------------------------------------------------------------- settings + wiring
@@ -173,6 +415,8 @@ $("askBtn").addEventListener("click", doAsk);
 $("askQ").addEventListener("keydown", (e) => { if (e.key === "Enter") doAsk(); });
 $("searchBtn").addEventListener("click", doSearch);
 $("searchQ").addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+$("graphGroup").addEventListener("click", () => graph.toggleGroup());
+$("graphReset").addEventListener("click", () => graph.reset());
 $("edSave").addEventListener("click", saveNote);
 $("edNew").addEventListener("click", clearEditor);
 $("edDelete").addEventListener("click", deleteNote);

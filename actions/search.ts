@@ -13,17 +13,39 @@ export async function search(k3: K3, p: Json): Promise<Json> {
   if (!query) return { query, results: [] };
   const hits = await k3.vectorSearch(query, Number(p.top_k ?? 8));
   const results = await hydrateHits(k3, hits);
-  // Semantic index still warming up? Fall back to a title/excerpt keyword scan so
-  // the box is never dead on a fresh vault.
+  // Semantic index still warming up? Fall back to a keyword scan so the box is
+  // never dead on a fresh vault. Two things the naive `title LIKE '%<whole query>%'`
+  // got wrong: (1) K3's SQL LIKE is CASE-SENSITIVE, so "zettelkasten" missed a note
+  // titled "Zettelkasten"; (2) matching the entire query as one substring can never
+  // hit a natural-language question ("what is a zettelkasten?"). So: lowercase both
+  // sides and match on any significant content word across title / excerpt / tags.
   if (results.length === 0) {
-    const like = sqlStr("%" + query.replace(/[%_]/g, "") + "%");
-    const rows = await k3.execute(
-      `SELECT note_id, title, slug, excerpt FROM notes WHERE deleted=0 AND ` +
-        `(title LIKE ${like} OR excerpt LIKE ${like}) ORDER BY updated_at DESC LIMIT ${Number(p.top_k ?? 8)}`,
-    );
+    const rows = await keywordScan(k3, query, Number(p.top_k ?? 8));
     return { query, mode: "keyword", results: rows.map((r) => ({ ...r, score: null })) };
   }
   return { query, mode: "semantic", results };
+}
+
+const STOPWORDS = new Set([
+  "the", "a", "an", "of", "to", "in", "is", "are", "was", "were", "what", "which", "how",
+  "why", "who", "when", "where", "and", "or", "for", "on", "with", "about", "do", "does",
+  "did", "my", "your", "me", "i", "it", "this", "that", "note", "notes", "tell", "explain",
+]);
+
+/** Case-insensitive, tokenized keyword match: a row hits if ANY content word of the
+ *  query appears in its title, excerpt, or tags. Falls back to the raw query when the
+ *  question is all stopwords/short tokens. */
+async function keywordScan(k3: K3, query: string, topK: number): Promise<Record<string, unknown>[]> {
+  const tokens = [...new Set(query.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3 && !STOPWORDS.has(t)))].slice(0, 8);
+  const terms = tokens.length ? tokens : [query.toLowerCase().trim()].filter(Boolean);
+  if (!terms.length) return [];
+  const ors = terms.map((t) => {
+    const like = sqlStr("%" + t.replace(/[%_]/g, "") + "%");
+    return `LOWER(title) LIKE ${like} OR LOWER(excerpt) LIKE ${like} OR LOWER(tags) LIKE ${like}`;
+  }).join(" OR ");
+  return await k3.execute(
+    `SELECT note_id, title, slug, excerpt FROM notes WHERE deleted=0 AND (${ors}) ORDER BY updated_at DESC LIMIT ${topK}`,
+  );
 }
 
 /** Turn raw vector hits (which carry the object `key` + `content`) into note cards. */

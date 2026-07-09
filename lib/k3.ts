@@ -246,8 +246,11 @@ export class K3 {
         }
         const data = await resp.json().catch(() => ({}));
         return (data.results ?? []).map((m: any) => ({
-          text: (m.content ?? m.text ?? m.key ?? "").trim(),
-          key: m.key,
+          text: (m.content ?? m.text ?? "").trim(),
+          // K3 vector/search nests the source key under `object` (results[].object.key).
+          // Reading a bare `m.key` yields undefined → every hit is dropped and search
+          // silently falls back to keyword. Accept both shapes.
+          key: m.object?.key ?? m.key ?? "",
           score: m.score,
         }));
       } catch {

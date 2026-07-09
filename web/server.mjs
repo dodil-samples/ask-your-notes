@@ -43,15 +43,27 @@ function readBody(req) {
   });
 }
 
+// Transient errors worth retrying: DNS blips (the platform's per-app record can be
+// briefly NXDOMAIN right after deploy while it propagates) and connection resets.
+const TRANSIENT = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "UND_ERR_CONNECT_TIMEOUT"]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function forward(body) {
   // Only fill in the project key when the caller didn't bring their own (an admin
   // key must win, so the private tier stays reachable through this same proxy).
   if (!body.key && PUBLIC_KEY) body.key = PUBLIC_KEY;
-  const res = await fetch(BACKEND_URL, {
-    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
-  }).catch((e) => { console.error("backend fetch failed:", e?.cause?.code || e.message); return null; });
-  if (!res) return { ok: false, error: "backend unreachable" };
-  return await res.json().catch(() => ({ ok: false, error: "non-JSON response" }));
+  const payload = JSON.stringify(body);
+  let lastCode = "";
+  for (let attempt = 0; attempt < 5; attempt++) {
+    if (attempt) await sleep(150 * attempt); // brief backoff so a new DNS lookup is issued
+    const res = await fetch(BACKEND_URL, {
+      method: "POST", headers: { "content-type": "application/json" }, body: payload,
+    }).catch((e) => { lastCode = e?.cause?.code || e.message; return null; });
+    if (res) return await res.json().catch(() => ({ ok: false, error: "non-JSON response" }));
+    if (!TRANSIENT.has(lastCode)) break; // a non-transient failure won't get better by retrying
+  }
+  console.error("backend fetch failed after retries:", lastCode);
+  return { ok: false, error: "backend unreachable" };
 }
 
 async function serveStatic(res, urlPath) {
