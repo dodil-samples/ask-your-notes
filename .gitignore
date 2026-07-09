@@ -1,0 +1,15 @@
+# Local env / secrets
+.env
+*.env.local
+
+# Logs
+*.log
+
+# Node (web/server.mjs is zero-dependency, but just in case)
+node_modules/
+
+# Deno
+.deno/
+
+# OS
+.DS_Store

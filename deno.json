@@ -1,0 +1,13 @@
+{
+  "//": "`ignite` is the platform-provided Deno SDK (start/Context/Handler), resolved by the Ignite deno runtime at deploy time. The `@std/*` entries are the Deno standard library from JSR — fetched and cached by the builder at compile time.",
+  "imports": {
+    "ignite": "./deno/sdk/ignite/bootstrap.ts",
+    "ignite/store": "./deno/sdk/ignite/store.ts",
+    "@std/ulid": "jsr:@std/ulid@^1",
+    "@std/csv": "jsr:@std/csv@^1",
+    "@std/async": "jsr:@std/async@^1"
+  },
+  "tasks": {
+    "smoke": "deno run --allow-env tests/smoke.ts"
+  }
+}

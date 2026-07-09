@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ask Your Notes</title>
+<style>
+  :root {
+    --surface:#fcfcfb; --plane:#f9f9f7; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
+    --grid:#e1e0d9; --accent:#6d4bd6; --accent-soft:#e3daf9;
+    --good:#0ca30c; --crit:#d03b3b;
+    --border:rgba(11,11,11,0.10);
+    --font: system-ui, -apple-system, "Segoe UI", sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --surface:#1a1a19; --plane:#0d0d0d; --ink:#fff; --ink2:#c3c2b7; --muted:#898781;
+      --grid:#2c2c2a; --accent:#a78bfa; --accent-soft:#2c2350; --border:rgba(255,255,255,0.10);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--plane); color:var(--ink); font-family:var(--font);
+         font-size:14px; line-height:1.55; }
+  a { color:var(--accent); cursor:pointer; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .wrap { max-width:1040px; margin:0 auto; padding:20px 16px 64px; }
+  header.top { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+               padding-bottom:12px; border-bottom:1px solid var(--border); margin-bottom:20px; }
+  header.top h1 { font-size:18px; margin:0; font-weight:700; }
+  .badge { font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid var(--border);
+           color:var(--ink2); background:var(--surface); }
+  .badge.anon { color:var(--good); border-color:color-mix(in srgb, var(--good) 40%, transparent); }
+  .badge.admin { color:var(--accent); border-color:color-mix(in srgb, var(--accent) 45%, transparent); }
+  .spacer { flex:1; }
+  button, input, select, textarea { font-family:var(--font); font-size:13px; }
+  button { cursor:pointer; border:1px solid var(--border); background:var(--surface); color:var(--ink);
+           padding:7px 12px; border-radius:8px; }
+  button.primary { background:var(--accent); color:#fff; border-color:transparent; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  input, select, textarea { background:var(--surface); color:var(--ink); border:1px solid var(--border);
+                  border-radius:8px; padding:8px 10px; width:100%; }
+  textarea { font-family:var(--mono); font-size:12.5px; line-height:1.5; resize:vertical; min-width:0; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:12px;
+          padding:16px; margin-bottom:16px; min-width:0; }
+  .card h2 { font-size:13px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted);
+             margin:0 0 12px; font-weight:600; }
+  .card h2 .sub { text-transform:none; letter-spacing:0; color:var(--ink2); font-weight:400; }
+  .tiles { display:grid; grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); gap:12px; }
+  .tile { background:var(--plane); border:1px solid var(--border); border-radius:10px; padding:12px 14px; }
+  .tile .v { font-size:24px; font-weight:700; }
+  .tile .l { font-size:12px; color:var(--muted); }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; min-width:0; }
+  .grow { flex:1 1 220px; min-width:0; }
+  .cols { display:grid; grid-template-columns:1fr; gap:16px; }
+  @media (min-width:820px) { .cols { grid-template-columns:340px 1fr; align-items:start; } }
+  .muted { color:var(--muted); }
+  .err { color:var(--crit); }
+  .chip { display:inline-block; font-size:11px; padding:2px 8px; margin:2px 4px 2px 0; border-radius:999px;
+          border:1px solid var(--border); color:var(--ink2); background:var(--plane); cursor:pointer; }
+  .chip.on { background:var(--accent-soft); color:var(--ink); border-color:transparent; }
+  .noteitem { padding:9px 10px; border:1px solid var(--border); border-radius:9px; margin-bottom:7px;
+              background:var(--plane); cursor:pointer; }
+  .noteitem:hover { border-color:var(--accent); }
+  .noteitem .t { font-weight:600; }
+  .noteitem .e { color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis;
+                 display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; }
+  .answer { background:var(--plane); border:1px solid var(--border); border-left:3px solid var(--accent);
+            border-radius:8px; padding:12px 14px; white-space:pre-wrap; word-break:break-word;
+            overflow-wrap:anywhere; }
+  .cites { margin-top:8px; }
+  .prose { border:1px solid var(--border); border-radius:8px; padding:14px 16px; background:var(--plane);
+           overflow-wrap:anywhere; word-break:break-word; }
+  .prose h1,.prose h2,.prose h3 { margin:.6em 0 .3em; line-height:1.25; }
+  .prose h1 { font-size:20px; } .prose h2 { font-size:17px; } .prose h3 { font-size:15px; }
+  .prose p { margin:.5em 0; } .prose code { font-family:var(--mono); font-size:12.5px;
+           background:var(--surface); padding:1px 5px; border-radius:5px; }
+  .prose pre { background:var(--surface); border:1px solid var(--border); border-radius:8px; padding:10px;
+           overflow:auto; } .prose ul { margin:.4em 0; padding-left:1.2em; }
+  .settings { display:none; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .settings.open { display:flex; }
+  label.fld { display:flex; flex-direction:column; gap:3px; font-size:12px; color:var(--muted); }
+  .hidden { display:none; }
+  .small { font-size:12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <h1>🪶 Ask Your Notes</h1>
+    <span class="badge anon" id="modeBadge">public · anon reader</span>
+    <span class="spacer"></span>
+    <button id="gear" title="Admin / connection settings">⚙ Settings</button>
+  </header>
+
+  <div class="settings card" id="settings">
+    <label class="fld grow">Backend URL (only if not using this server's proxy)
+      <input id="cfgUrl" placeholder="/api (default — same-origin proxy)" />
+    </label>
+    <label class="fld grow">Admin key (unlocks authoring)
+      <input id="cfgAk" type="password" placeholder="ak_… — write/delete notes" />
+    </label>
+    <div class="row" style="align-items:flex-end"><button class="primary" id="cfgSave">Save</button></div>
+  </div>
+
+  <!-- ASK (RAG) -->
+  <section class="card">
+    <h2>Ask your notes <span class="sub">— retrieval-augmented answer, grounded + cited</span></h2>
+    <div class="row">
+      <input id="askQ" class="grow" placeholder="e.g. how should I structure my vault?"
+             value="what is a zettelkasten?" />
+      <button class="primary" id="askBtn">Ask</button>
+    </div>
+    <div id="askOut" class="hidden" style="margin-top:12px"></div>
+  </section>
+
+  <!-- OVERVIEW -->
+  <section class="card">
+    <h2>Vault overview <span class="sub">— public_overview, no credentials</span></h2>
+    <div class="tiles" id="tiles"><span class="muted">Loading…</span></div>
+    <div id="tagcloud" style="margin-top:14px"></div>
+  </section>
+
+  <div class="cols">
+    <!-- LEFT: search + list -->
+    <div>
+      <section class="card">
+        <h2>Search <span class="sub">— semantic</span></h2>
+        <div class="row">
+          <input id="searchQ" class="grow" placeholder="search notes…" />
+          <button id="searchBtn">Go</button>
+        </div>
+        <div id="notelist" style="margin-top:12px"><span class="muted small">Recent notes…</span></div>
+      </section>
+    </div>
+
+    <!-- RIGHT: viewer / editor -->
+    <div>
+      <section class="card" id="viewerCard">
+        <h2 id="viewerHead">Note <span class="sub" id="viewerSub">— select a note on the left</span></h2>
+        <div id="viewer"><span class="muted small">Nothing selected.</span></div>
+      </section>
+
+      <section class="card hidden" id="editorCard">
+        <h2>New / edit note <span class="sub">— admin only · <code>[[wikilinks]]</code> build the graph</span></h2>
+        <input id="edTitle" placeholder="Title" style="margin-bottom:8px" />
+        <input id="edTags" placeholder="tags, comma separated" style="margin-bottom:8px" />
+        <textarea id="edBody" rows="9" placeholder="# Markdown body&#10;&#10;Link to another note with [[Its Title]]."></textarea>
+        <input id="edId" type="hidden" />
+        <div class="row" style="margin-top:10px">
+          <button class="primary" id="edSave">Save note</button>
+          <button id="edNew">Clear</button>
+          <button id="edDelete" class="hidden" style="margin-left:auto">Delete</button>
+          <span class="small muted" id="edMsg"></span>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <p class="muted small">
+    Reading is anonymous — the page calls its own origin, which proxies to the app's
+    public FQDN. Authoring needs an admin key (⚙ Settings); it is attached to the
+    request and never stored in the page. Notes are markdown objects in K3; the
+    <code>[[wikilink]]</code> graph and semantic index are built server-side.
+  </p>
+</div>
+<script src="./app.js"></script>
+</body>
+</html>

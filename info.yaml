@@ -1,0 +1,62 @@
+name: ask-your-notes
+description: >
+  A local-first, "Obsidian-killer" knowledge base on Ignite + K3. Markdown note
+  bodies live as objects, note metadata and the [[wikilink]] graph in the K3 SQL
+  warehouse, and a vector collection over the bodies powers semantic search and a
+  retrieval-augmented `ask` (RAG) that answers questions grounded in your notes.
+  One action-routed Deno function; backlinks and the graph are plain SQL.
+runtime: deno
+mcp_enabled: true
+
+input:
+  type: object
+  required: [action]
+  properties:
+    action:
+      type: string
+      # PUBLIC (anon-safe, read-only vault): search, ask, get_note, list_notes,
+      #   backlinks, tags, graph, public_overview
+      # PRIVATE (admin key, editing): put_note, delete_note, reindex, export,
+      #   create_key, list_keys, revoke_key
+      enum: [search, ask, get_note, list_notes, backlinks, tags, graph, public_overview,
+             put_note, delete_note, reindex, export,
+             create_key, list_keys, revoke_key]
+    key:
+      type: string
+      description: >
+        API key in the request body. A project (public) key authorizes PUBLIC
+        actions; an admin key authorizes PRIVATE actions. Omit when the app's key
+        tiers are unconfigured (open).
+    query: { type: string, description: "search / ask question" }
+    title: { type: string }
+    body: { type: string, description: "markdown note body; [[wikilinks]] are parsed into the graph" }
+    tags: { type: array, items: { type: string } }
+    note_id: { type: string }
+    slug: { type: string }
+    top_k: { type: integer }
+    format: { type: string, enum: [json, csv], description: "for action=export" }
+
+output:
+  type: object
+  properties:
+    ok: { type: boolean }
+    action: { type: string }
+    result: { type: object }
+
+env:
+  - DODIL_SA_ID
+  - DODIL_SA_SECRET
+  # Public/private gate (see lib/gate.ts). Comma-separated. If a tier has no key
+  # configured (env + api_keys table both empty), that tier is open.
+  - ADMIN_KEYS      # authorizes PRIVATE actions (editing the vault, key mgmt)
+  - PUBLIC_KEYS     # authorizes PUBLIC actions (reading the vault); the project key
+  - MODEL_NAME      # optional: chat model for `ask` (default kimi-k2.6)
+  - EMBED_MODEL     # optional: embedding model for search (default jina-embeddings-v4)
+
+test_input:
+  action: put_note
+  title: Zettelkasten
+  body: >
+    A durable knowledge base is built from atomic notes that link to each other.
+    See [[Atomic notes]] and [[Backlinks]].
+  tags: [pkm, method]
