@@ -110,20 +110,26 @@ async function openNote(slugOrId) {
     return;
   }
   const n = r.result;
-  setActiveNote(n.note_id);
-  $("viewerHead").innerHTML = `${esc(n.title)} <span class="sub">/${esc(n.slug)}</span>`;
-  $("viewerSub").textContent = "";
-  const tags = (n.tags || []).map((t) => `<span class="chip" data-tag="${esc(t)}">${esc(t)}</span>`).join("");
-  const back = (n.backlinks || []).map((b) => `<div class="noteitem" data-slug="${esc(b.slug)}"><div class="t">${esc(b.title)}</div></div>`).join("")
-    || `<span class="muted small">No backlinks.</span>`;
-  const out = (n.outgoing_links || []).map((l) => `<a data-slug="${esc(l.dst_slug)}">${esc(l.dst_title || l.dst_slug)}</a>`).join(" · ")
-    || `<span class="muted small">none</span>`;
-  $("viewer").innerHTML = `
-    <div style="margin-bottom:8px">${tags}</div>
-    <div class="prose">${renderMd(n.body || "*empty note*")}</div>
-    <div class="small" style="margin-top:12px"><b class="muted">Links to:</b> ${out}</div>
-    <div style="margin-top:12px"><h2 style="margin-bottom:6px">Backlinks</h2>${back}</div>`;
-  if (store.ak) loadIntoEditor(n);
+  try {
+    setActiveNote(n.note_id);
+    // NB: replacing viewerHead's innerHTML destroys the #viewerSub span that lived
+    // inside it — so DON'T touch $("viewerSub") after this line (it's now null).
+    $("viewerHead").innerHTML = `${esc(n.title)} <span class="sub">/${esc(n.slug)}</span>`;
+    const tags = (n.tags || []).map((t) => `<span class="chip" data-tag="${esc(t)}">${esc(t)}</span>`).join("");
+    const back = (n.backlinks || []).map((b) => `<div class="noteitem" data-slug="${esc(b.slug)}"><div class="t">${esc(b.title)}</div></div>`).join("")
+      || `<span class="muted small">No backlinks.</span>`;
+    const out = (n.outgoing_links || []).map((l) => `<a data-slug="${esc(l.dst_slug)}">${esc(l.dst_title || l.dst_slug)}</a>`).join(" · ")
+      || `<span class="muted small">none</span>`;
+    $("viewer").innerHTML = `
+      <div style="margin-bottom:8px">${tags}</div>
+      <div class="prose">${renderMd(n.body || "*empty note*")}</div>
+      <div class="small" style="margin-top:12px"><b class="muted">Links to:</b> ${out}</div>
+      <div style="margin-top:12px"><h2 style="margin-bottom:6px">Backlinks</h2>${back}</div>`;
+    if (store.ak) loadIntoEditor(n);
+  } catch (e) {
+    // Never leave the pane stuck on the loading state if rendering throws.
+    $("viewer").innerHTML = `<span class="err">Couldn't render note: ${esc(e.message)}</span>`;
+  }
 }
 
 /** Reflect the open note everywhere: list rows, graph node, and remembered id. */
