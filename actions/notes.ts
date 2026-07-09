@@ -7,6 +7,7 @@ import { K3 } from "../lib/k3.ts";
 import { retry } from "@std/async";
 import { stringify as csvStringify } from "@std/csv";
 import {
+  EVENTUAL,
   excerptOf,
   type Json,
   noteIdFromKey,
@@ -78,6 +79,12 @@ export async function putNote(k3: K3, p: Json): Promise<Json> {
     }));
   }
 
+  // Drain the write-log so the EVENTUAL reads that every read action now uses see
+  // this write immediately — read-your-writes without the per-read strong-merge cost.
+  try {
+    await Promise.all([k3.compact("notes"), k3.compact("links")]);
+  } catch { /* best-effort — a background compaction will catch up */ }
+
   // Kick vector re-ingest of the new/changed body (best-effort, budgeted).
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(new DOMException("ingest budget", "TimeoutError")), 12000);
@@ -97,6 +104,9 @@ export async function deleteNote(k3: K3, p: Json): Promise<Json> {
   try {
     await k3.putObject(`notes/${noteId}.md`, "", "text/markdown"); // tombstone the body
   } catch { /* best-effort */ }
+  try {
+    await Promise.all([k3.compact("notes"), k3.compact("links")]); // so EVENTUAL reads drop it now
+  } catch { /* best-effort */ }
   return { deleted: noteId };
 }
 
@@ -113,26 +123,58 @@ export async function reindex(k3: K3, _p: Json): Promise<Json> {
 
 // ------------------------------------------------------------------------- reads
 export async function getNote(k3: K3, p: Json): Promise<Json> {
-  const noteId = await resolveId(k3, p);
-  if (!noteId) return { error: "note not found (pass note_id or slug)", code: 404 };
-  const meta = (await k3.execute(
-    `SELECT note_id, title, slug, tags, word_count, created_at, updated_at FROM notes ` +
-      `WHERE note_id=${sqlStr(noteId)} AND deleted=0 LIMIT 1`,
-  ))[0];
+  // Resolve + fetch metadata in ONE query (folding in what resolveId used to do on
+  // its own), then fan the three independent follow-ups — body object, outgoing
+  // links, backlinks — out in parallel. Reads use EVENTUAL freshness (the cheap
+  // path; writes compact so it still reads-your-writes), turning ~5 sequential
+  // strong round-trips (~6-10s) into 1 + 1 parallel (~1s).
+  const byId = !!p.note_id;
+  const key = byId ? String(p.note_id) : (p.slug ? slugify(String(p.slug)) : "");
+  if (!key) return { error: "note not found (pass note_id or slug)", code: 404 };
+  // Each K3 warehouse read is ~1.3s, so the win is doing them in as few parallel
+  // rounds as possible. Both of these are derivable from the INPUT (not from each
+  // other), so fan them out together:
+  //   • the note's metadata row
+  //   • the ids of notes that link here (backlinks are keyed by the target's slug —
+  //     or its id when opened by id — so we don't need the metadata first)
+  // The OUTGOING links are just the [[wikilinks]] in the body, so the client derives
+  // those for free — no query at all.
+  const [metaRows, srcRows] = await Promise.all([
+    k3.execute(
+      `SELECT note_id, title, slug, tags, word_count, created_at, updated_at FROM notes ` +
+        `WHERE ${byId ? "note_id" : "slug"}=${sqlStr(key)} AND deleted=0 LIMIT 1`,
+      EVENTUAL,
+    ),
+    k3.execute(
+      `SELECT DISTINCT src_id FROM links WHERE ${byId ? "dst_id" : "dst_slug"}=${sqlStr(key)} LIMIT 100`,
+      EVENTUAL,
+    ),
+  ]);
+  const meta = metaRows[0];
   if (!meta) return { error: "note not found", code: 404 };
-  let body = "";
-  try {
-    body = await k3.getObject(`notes/${noteId}.md`);
-  } catch { /* body missing — return metadata only */ }
-  const outgoing = await k3.execute(
-    `SELECT dst_slug, dst_id, dst_title FROM links WHERE src_id=${sqlStr(noteId)} ORDER BY dst_title`,
-  );
-  const incoming = await backlinksFor(k3, meta);
+  const noteId = String(meta.note_id);
+  const srcIds = [...new Set(srcRows.map((r) => String(r.src_id)).filter(Boolean))];
+  // Round two: the body object and the backlink note rows, again in parallel.
+  const [body, incoming] = await Promise.all([
+    (async () => {
+      try {
+        return await k3.getObject(`notes/${noteId}.md`);
+      } catch {
+        return ""; // body object missing — return metadata only
+      }
+    })(),
+    srcIds.length
+      ? k3.execute(
+        `SELECT note_id, title, slug, excerpt FROM notes ` +
+          `WHERE deleted=0 AND note_id IN (${srcIds.map(sqlStr).join(", ")}) ORDER BY title LIMIT 100`,
+        EVENTUAL,
+      )
+      : Promise.resolve([] as Record<string, unknown>[]),
+  ]);
   return {
     ...meta,
     tags: String(meta.tags ?? "").split(",").filter(Boolean),
     body,
-    outgoing_links: outgoing,
     backlinks: incoming,
   };
 }
@@ -145,13 +187,21 @@ export async function backlinksFor(k3: K3, meta: Json): Promise<Json[]> {
   // unresolved stub node (no note yet) we match by slug only — matching an empty
   // dst_id would wrongly capture every unresolved link.
   const conds: string[] = [];
-  if (noteId) conds.push(`l.dst_id=${sqlStr(noteId)}`);
-  if (slug) conds.push(`l.dst_slug=${sqlStr(slug)}`);
+  if (noteId) conds.push(`dst_id=${sqlStr(noteId)}`);
+  if (slug) conds.push(`dst_slug=${sqlStr(slug)}`);
   if (!conds.length) return [];
+  // Two cheap single-table lookups instead of one JOIN — the JOIN is markedly
+  // slower on the warehouse than an id-IN scan, and the edge set here is small.
+  const srcRows = await k3.execute(
+    `SELECT DISTINCT src_id FROM links WHERE ${conds.join(" OR ")} LIMIT 100`,
+    EVENTUAL,
+  );
+  const ids = [...new Set(srcRows.map((r) => String(r.src_id)).filter(Boolean))];
+  if (!ids.length) return [];
   return await k3.execute(
-    `SELECT DISTINCT n.note_id, n.title, n.slug, n.excerpt FROM links l ` +
-      `JOIN notes n ON n.note_id = l.src_id AND n.deleted=0 ` +
-      `WHERE ${conds.join(" OR ")} ORDER BY n.title LIMIT 100`,
+    `SELECT note_id, title, slug, excerpt FROM notes ` +
+      `WHERE deleted=0 AND note_id IN (${ids.map(sqlStr).join(", ")}) ORDER BY title LIMIT 100`,
+    EVENTUAL,
   );
 }
 
@@ -179,6 +229,7 @@ export async function listNotes(k3: K3, p: Json): Promise<Json> {
   const rows = await k3.execute(
     `SELECT note_id, title, slug, tags, excerpt, word_count, updated_at FROM notes ` +
       `WHERE ${where.join(" AND ")} ORDER BY ${order} LIMIT ${limit}`,
+    EVENTUAL,
   );
   return {
     notes: rows.map((r) => ({ ...r, tags: String(r.tags ?? "").split(",").filter(Boolean) })),
@@ -187,7 +238,7 @@ export async function listNotes(k3: K3, p: Json): Promise<Json> {
 }
 
 export async function tags(k3: K3, _p: Json): Promise<Json> {
-  const rows = await k3.execute("SELECT tags FROM notes WHERE deleted=0 AND tags <> ''");
+  const rows = await k3.execute("SELECT tags FROM notes WHERE deleted=0 AND tags <> ''", EVENTUAL);
   const counts = new Map<string, number>();
   for (const r of rows) {
     for (const t of String(r.tags ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
@@ -200,11 +251,14 @@ export async function tags(k3: K3, _p: Json): Promise<Json> {
 
 export async function graph(k3: K3, p: Json): Promise<Json> {
   const limit = Math.min(Number(p.limit ?? 200), 1000);
-  const nodes = await k3.execute(
-    `SELECT note_id, title, slug, excerpt FROM notes WHERE deleted=0 ORDER BY updated_at DESC LIMIT ${limit}`,
-  );
+  const [nodes, edgeRows] = await Promise.all([
+    k3.execute(
+      `SELECT note_id, title, slug, excerpt FROM notes WHERE deleted=0 ORDER BY updated_at DESC LIMIT ${limit}`,
+      EVENTUAL,
+    ),
+    k3.execute(`SELECT src_id, dst_id FROM links WHERE dst_id <> ''`, EVENTUAL),
+  ]);
   const ids = new Set(nodes.map((n) => String(n.note_id)));
-  const edgeRows = await k3.execute(`SELECT src_id, dst_id FROM links WHERE dst_id <> ''`);
   const edges = edgeRows
     .filter((e) => ids.has(String(e.src_id)) && ids.has(String(e.dst_id)))
     .map((e) => ({ source: String(e.src_id), target: String(e.dst_id) }));
@@ -307,12 +361,19 @@ export async function exportVault(k3: K3, p: Json): Promise<Json> {
 
 // Aggregate, anon-safe rollup for the dashboard's default view.
 export async function publicOverview(k3: K3, p: Json): Promise<Json> {
-  const [totals] = await k3.execute(
-    `SELECT COUNT(*) AS notes, SUM(word_count) AS words FROM notes WHERE deleted=0`,
-  );
-  const [linkRow] = await k3.execute(`SELECT COUNT(*) AS links FROM links`);
-  const recent = (await listNotes(k3, { limit: Number(p.limit ?? 8) })).notes ?? [];
-  const topTags = ((await tags(k3, {})).tags ?? []).slice(0, 12);
+  // All four rollups are independent — fan them out instead of walking them in
+  // series, and read the compacted snapshot (COUNT/SUM scalars are exactly where
+  // strong freshness is slowest).
+  const [totalsRows, linkRows, recentRes, tagsRes] = await Promise.all([
+    k3.execute(`SELECT COUNT(*) AS notes, SUM(word_count) AS words FROM notes WHERE deleted=0`, EVENTUAL),
+    k3.execute(`SELECT COUNT(*) AS links FROM links`, EVENTUAL),
+    listNotes(k3, { limit: Number(p.limit ?? 8) }),
+    tags(k3, {}),
+  ]);
+  const totals = totalsRows[0];
+  const linkRow = linkRows[0];
+  const recent = recentRes.notes ?? [];
+  const topTags = (tagsRes.tags ?? []).slice(0, 12);
   return {
     totals: {
       notes: Number(totals?.notes ?? 0),

@@ -6,7 +6,7 @@
 
 import { K3 } from "../lib/k3.ts";
 import * as models from "../lib/models.ts";
-import { type Json, noteIdFromKey, sqlStr } from "./common.ts";
+import { EVENTUAL, type Json, noteIdFromKey, sqlStr } from "./common.ts";
 
 export async function search(k3: K3, p: Json): Promise<Json> {
   const query = String(p.query ?? "").trim();
@@ -45,6 +45,7 @@ async function keywordScan(k3: K3, query: string, topK: number): Promise<Record<
   }).join(" OR ");
   return await k3.execute(
     `SELECT note_id, title, slug, excerpt FROM notes WHERE deleted=0 AND (${ors}) ORDER BY updated_at DESC LIMIT ${topK}`,
+    EVENTUAL,
   );
 }
 
@@ -59,6 +60,7 @@ export async function hydrateHits(k3: K3, hits: Array<Record<string, unknown>>):
   const rows = await k3.execute(
     `SELECT note_id, title, slug, excerpt FROM notes WHERE deleted=0 AND ` +
       `note_id IN (${[...byId.keys()].map(sqlStr).join(", ")})`,
+    EVENTUAL,
   );
   const out: Json[] = [];
   for (const r of rows) {

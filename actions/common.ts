@@ -17,6 +17,11 @@ export const nowIso = () => new Date().toISOString().replace(/\.\d+Z$/, "Z");
 export const uid = () => "n_" + monotonicUlid();
 export const sqlStr = (v: unknown) => "'" + String(v).replace(/'/g, "''") + "'";
 
+// Freshness for read queries. STRONG merges the write-log on every read (~1.5s+ per
+// query here); EVENTUAL serves the compacted snapshot (cheap). Reads use EVENTUAL and
+// writes compact() right after, so the vault still reads-your-writes.
+export const EVENTUAL = "FRESHNESS_EVENTUAL";
+
 /** Obsidian-style slug: lowercased, non-alnum → hyphen. The wikilink target. */
 export function slugify(s: string): string {
   return (String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "untitled").slice(0, 80);

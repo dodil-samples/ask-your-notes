@@ -57,6 +57,21 @@ function renderMd(src) {
 }
 const slug = (s) => (String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "untitled").slice(0, 80);
 
+/** Outgoing links are just the [[wikilinks]] in the body — derive them here rather
+ *  than making the backend run an extra query on every note open. */
+function outgoingFromBody(body) {
+  const seen = new Set(), out = [];
+  const re = /\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]/g;
+  let m;
+  while ((m = re.exec(String(body || ""))) !== null) {
+    const title = m[1].trim();
+    if (!title) continue;
+    const s = slug(title);
+    if (!seen.has(s)) { seen.add(s); out.push({ slug: s, title }); }
+  }
+  return out;
+}
+
 // ------------------------------------------------------------------- overview + graph
 async function loadOverview() {
   const r = await invoke("public_overview", { limit: 8 });
@@ -118,7 +133,7 @@ async function openNote(slugOrId) {
     const tags = (n.tags || []).map((t) => `<span class="chip" data-tag="${esc(t)}">${esc(t)}</span>`).join("");
     const back = (n.backlinks || []).map((b) => `<div class="noteitem" data-slug="${esc(b.slug)}"><div class="t">${esc(b.title)}</div></div>`).join("")
       || `<span class="muted small">No backlinks.</span>`;
-    const out = (n.outgoing_links || []).map((l) => `<a data-slug="${esc(l.dst_slug)}">${esc(l.dst_title || l.dst_slug)}</a>`).join(" · ")
+    const out = outgoingFromBody(n.body).map((l) => `<a data-slug="${esc(l.slug)}">${esc(l.title)}</a>`).join(" · ")
       || `<span class="muted small">none</span>`;
     $("viewer").innerHTML = `
       <div style="margin-bottom:8px">${tags}</div>

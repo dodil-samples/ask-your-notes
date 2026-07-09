@@ -116,12 +116,11 @@ class FakeK3 {
     // ---- tags ----
     if (S.startsWith("SELECT tags FROM notes")) return live().filter((n) => (n.tags ?? "") !== "").map((n) => ({ tags: n.tags }));
 
-    // ---- backlinks (links ⋈ notes) ----
-    if (S.includes("FROM links l JOIN notes n")) {
-      const dstId = val("l.dst_id"); const dstSlug = val("l.dst_slug");
-      const srcIds = new Set(this.tables.links.filter((l) => l.dst_id === dstId || l.dst_slug === dstSlug).map((l) => l.src_id));
-      return live().filter((n) => srcIds.has(n.note_id))
-        .map((n) => ({ note_id: n.note_id, title: n.title, slug: n.slug, excerpt: n.excerpt }));
+    // ---- backlinks step 1: source ids that link here (the notes IN-scan is below) ----
+    if (S.startsWith("SELECT DISTINCT src_id FROM links WHERE")) {
+      const dstId = val("dst_id"); const dstSlug = val("dst_slug");
+      const ids = [...new Set(this.tables.links.filter((l) => l.dst_id === dstId || l.dst_slug === dstSlug).map((l) => l.src_id))];
+      return ids.map((id) => ({ src_id: id }));
     }
 
     // ---- outgoing links for a note ----
@@ -145,8 +144,12 @@ class FakeK3 {
       const id = val("note_id"); const n = this.tables.notes.find((x) => x.note_id === id);
       return n ? [{ note_id: n.note_id, slug: n.slug }] : [];
     }
-    if (S.startsWith("SELECT note_id, title, slug, tags, word_count, created_at, updated_at FROM notes WHERE note_id=")) {
-      const id = val("note_id"); const n = live().find((x) => x.note_id === id);
+    if (S.startsWith("SELECT note_id, title, slug, tags, word_count, created_at, updated_at FROM notes WHERE")
+      && (S.includes("WHERE note_id=") || S.includes("WHERE slug="))) {
+      // get_note now resolves by note_id OR slug in one query.
+      const n = S.includes("WHERE note_id=")
+        ? live().find((x) => x.note_id === val("note_id"))
+        : live().find((x) => x.slug === val("slug"));
       return n ? [n] : [];
     }
     if (S.startsWith("SELECT note_id, slug, title FROM notes WHERE deleted=0 AND slug IN")) {
@@ -223,7 +226,7 @@ const g = await call({ action: "get_note", slug: "atomic-notes" });
 assert(g.ok && g.result.title === "Atomic notes", "get_note resolves by slug");
 assert(g.result.body.includes("One idea per note"), "get_note round-trips the body object");
 assert(g.result.backlinks.some((n: Row) => n.slug === "zettelkasten"), "Zettelkasten backlinks to Atomic notes");
-assert(g.result.outgoing_links.some((l: Row) => l.dst_slug === "zettelkasten"), "outgoing link Atomic→Zettelkasten present");
+assert(String(g.result.body).includes("[[Zettelkasten]]"), "body carries the outgoing [[wikilink]] (client derives 'Links to')");
 
 const bl = await call({ action: "backlinks", slug: "backlinks" });
 assert(bl.ok && bl.result.backlinks.some((n: Row) => n.slug === "zettelkasten"),
